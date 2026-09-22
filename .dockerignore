@@ -1,0 +1,10 @@
+.git
+.idea
+.vscode
+bin
+*.md
+docker-compose.yaml
+.env
+.env.example
+api
+coverage.out

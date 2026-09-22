@@ -1,0 +1,242 @@
+### Примеры запросов ко всем сервисам.
+### Файл открывается в JetBrains HTTP Client и в VS Code REST Client.
+### Порядок: вход администратора -> товар -> пользователь -> заказ -> уведомления.
+
+@userHost = http://localhost:8081
+@productHost = http://localhost:8082
+@orderHost = http://localhost:8083
+@notificationHost = http://localhost:8084
+
+@adminEmail = admin@shop.local
+@adminPassword = admin_local_password
+
+@userEmail = user@shop.local
+@userPassword = user_local_password
+
+###############################################################################
+# 1. Пользователи (user-service, порт 8081)
+###############################################################################
+
+### 1.1 Регистрация пользователя. Роль всегда USER.
+POST {{userHost}}/api/v1/auth/register
+Content-Type: application/json
+
+{
+  "email": "{{userEmail}}",
+  "password": "{{userPassword}}"
+}
+
+### 1.2 Вход администратора. Администратор создаётся при старте сервиса
+### из переменных BOOTSTRAP_ADMIN_EMAIL / BOOTSTRAP_ADMIN_PASSWORD.
+# @name adminLogin
+POST {{userHost}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{adminEmail}}",
+  "password": "{{adminPassword}}"
+}
+
+> {% client.global.set("adminToken", response.body.access_token); %}
+
+### 1.3 Вход пользователя.
+# @name userLogin
+POST {{userHost}}/api/v1/auth/login
+Content-Type: application/json
+
+{
+  "email": "{{userEmail}}",
+  "password": "{{userPassword}}"
+}
+
+> {% client.global.set("userToken", response.body.access_token); %}
+
+### 1.4 Текущий пользователь.
+GET {{userHost}}/api/v1/users/me
+Authorization: Bearer {{userToken}}
+
+### 1.5 Список пользователей — только ADMIN.
+GET {{userHost}}/api/v1/users?limit=20&offset=0
+Authorization: Bearer {{adminToken}}
+
+### 1.6 Проверка здоровья.
+GET {{userHost}}/healthz
+
+###############################################################################
+# 2. Каталог (product-service, порт 8082)
+###############################################################################
+
+### 2.1 Создание товара — только ADMIN.
+# @name createProduct
+POST {{productHost}}/api/v1/products
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "sku": "SKU-COFFEE-001",
+  "name": "Кофемолка ручная",
+  "description": "Жернова из керамики",
+  "category": "kitchen",
+  "price_cents": 599000,
+  "stock": 10
+}
+
+> {% client.global.set("productId", response.body.id); %}
+
+### 2.2 Дефицитный товар — понадобится для сценария отказа в резерве.
+# @name createScarceProduct
+POST {{productHost}}/api/v1/products
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "sku": "SKU-TEAPOT-001",
+  "name": "Редкий чайник",
+  "description": "Последний экземпляр",
+  "category": "kitchen",
+  "price_cents": 1200000,
+  "stock": 1
+}
+
+> {% client.global.set("scarceProductId", response.body.id); %}
+
+### 2.3 Каталог с фильтром по категории и пагинацией — доступен всем.
+GET {{productHost}}/api/v1/products?category=kitchen&limit=20&offset=0
+
+### 2.4 Карточка товара.
+GET {{productHost}}/api/v1/products/{{productId}}
+
+### 2.5 Обновление товара — только ADMIN.
+PUT {{productHost}}/api/v1/products/{{productId}}
+Authorization: Bearer {{adminToken}}
+Content-Type: application/json
+
+{
+  "sku": "SKU-COFFEE-001",
+  "name": "Кофемолка ручная PRO",
+  "description": "Жернова из керамики, регулировка помола",
+  "category": "kitchen",
+  "price_cents": 649000,
+  "stock": 12
+}
+
+### 2.6 Удаление товара — только ADMIN.
+DELETE {{productHost}}/api/v1/products/{{scarceProductId}}
+Authorization: Bearer {{adminToken}}
+
+### 2.7 Попытка создать товар обычным пользователем — 403.
+POST {{productHost}}/api/v1/products
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+
+{
+  "sku": "SKU-FORBIDDEN",
+  "name": "Нельзя",
+  "category": "kitchen",
+  "price_cents": 100,
+  "stock": 1
+}
+
+###############################################################################
+# 3. Заказы (order-service, порт 8083)
+###############################################################################
+
+### 3.1 Создание заказа. Заголовок Idempotency-Key обязателен.
+### Заказ создаётся в статусе NEW; дальше сага идёт на событиях:
+### order.created -> stock.reserved -> RESERVED -> COMPLETED.
+# @name createOrder
+POST {{orderHost}}/api/v1/orders
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+Idempotency-Key: 6f1b0e6c-1a5e-4c9f-9b2e-0a1d2c3b4a55
+
+{
+  "items": [
+    { "product_id": "{{productId}}", "quantity": 2 }
+  ]
+}
+
+> {% client.global.set("orderId", response.body.id); %}
+
+### 3.2 Повтор того же запроса с тем же ключом: вернётся 200 и тот же заказ.
+POST {{orderHost}}/api/v1/orders
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+Idempotency-Key: 6f1b0e6c-1a5e-4c9f-9b2e-0a1d2c3b4a55
+
+{
+  "items": [
+    { "product_id": "{{productId}}", "quantity": 2 }
+  ]
+}
+
+### 3.3 Тот же ключ с другим составом заказа — 409.
+POST {{orderHost}}/api/v1/orders
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+Idempotency-Key: 6f1b0e6c-1a5e-4c9f-9b2e-0a1d2c3b4a55
+
+{
+  "items": [
+    { "product_id": "{{productId}}", "quantity": 5 }
+  ]
+}
+
+### 3.4 Статус заказа. Через 1-2 секунды после создания он станет COMPLETED
+### (при ORDER_AUTO_COMPLETE=true).
+GET {{orderHost}}/api/v1/orders/{{orderId}}
+Authorization: Bearer {{userToken}}
+
+### 3.5 Список своих заказов с фильтром по статусу.
+GET {{orderHost}}/api/v1/orders?status=COMPLETED&limit=20&offset=0
+Authorization: Bearer {{userToken}}
+
+### 3.6 Заказ, которому не хватит товара: перейдёт в CANCELLED,
+### остаток на складе не изменится.
+POST {{orderHost}}/api/v1/orders
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+Idempotency-Key: 9a2c4e17-3f61-4c2a-8f0d-11c2b3d4e5f6
+
+{
+  "items": [
+    { "product_id": "{{scarceProductId}}", "quantity": 99 }
+  ]
+}
+
+### 3.7 Завершение заказа вручную (нужно при ORDER_AUTO_COMPLETE=false):
+### переход RESERVED -> COMPLETED.
+POST {{orderHost}}/api/v1/orders/{{orderId}}/complete
+Authorization: Bearer {{userToken}}
+
+### 3.8 Отмена заказа. Из статуса RESERVED публикуется компенсирующее
+### событие order.cancelled, и product-service возвращает остаток.
+POST {{orderHost}}/api/v1/orders/{{orderId}}/cancel
+Authorization: Bearer {{userToken}}
+Content-Type: application/json
+
+{
+  "reason": "покупатель передумал"
+}
+
+### 3.9 Администратор видит все заказы.
+GET {{orderHost}}/api/v1/orders?limit=50
+Authorization: Bearer {{adminToken}}
+
+###############################################################################
+# 4. Уведомления (notification-service, порт 8084)
+###############################################################################
+
+### 4.1 Уведомления по заказу. Пользователь видит только свои.
+GET {{notificationHost}}/api/v1/notifications?order_id={{orderId}}&limit=50
+Authorization: Bearer {{userToken}}
+
+### 4.2 Администратор видит уведомления всех пользователей.
+GET {{notificationHost}}/api/v1/notifications?limit=50
+Authorization: Bearer {{adminToken}}
+
+### 4.3 Проверка здоровья и готовности.
+GET {{notificationHost}}/healthz
+
+###
+GET {{notificationHost}}/readyz

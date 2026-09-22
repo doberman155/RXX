@@ -1,0 +1,25 @@
+# Сборка
+/bin/
+*.exe
+*.test
+
+# Покрытие
+coverage.out
+cov_*.out
+*.cover
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# ОС
+.DS_Store
+Thumbs.db
+
+# Локальные переопределения окружения.
+# Сам .env с параметрами стенда намеренно лежит в репозитории: в нём только
+# значения для локальной разработки, чтобы стек поднимался одной командой.
+.env.local
+.env.*.local
+docker-compose.override.yaml

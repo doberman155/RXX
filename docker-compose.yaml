@@ -1,0 +1,181 @@
+# Локальный стенд: Redpanda (Kafka без ZooKeeper), PostgreSQL и четыре сервиса.
+# Запуск: docker compose up -d --build
+
+name: shop
+
+x-service-env: &service-env
+  APP_ENV: docker
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  KAFKA_BROKERS: redpanda:9092
+  KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+  KAFKA_MAX_RETRIES: ${KAFKA_MAX_RETRIES:-3}
+  KAFKA_RETRY_BACKOFF: ${KAFKA_RETRY_BACKOFF:-500ms}
+  JWT_SECRET: ${JWT_SECRET}
+  JWT_TTL: ${JWT_TTL:-24h}
+  JWT_ISSUER: user-service
+  OUTBOX_POLL_INTERVAL: ${OUTBOX_POLL_INTERVAL:-500ms}
+  SHUTDOWN_TIMEOUT: ${SHUTDOWN_TIMEOUT:-20s}
+
+x-service-defaults: &service-defaults
+  restart: unless-stopped
+  depends_on:
+    postgres:
+      condition: service_healthy
+    redpanda:
+      condition: service_healthy
+    kafka-init:
+      condition: service_completed_successfully
+
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.1.1
+    container_name: shop-redpanda
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --default-log-level=warn
+      # internal — для сервисов внутри сети compose, external — для хоста.
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+    ports:
+      - "19092:19092"
+      - "9644:9644"
+    volumes:
+      - redpanda-data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 10s
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: shop-postgres
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-shop}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: postgres
+    ports:
+      - "5433:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./deploy/postgres/init-databases.sh:/docker-entrypoint-initdb.d/10-init-databases.sh:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-shop} -d postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Одноразовая задача: создаёт топики по 3 партиции и их DLQ.
+  kafka-init:
+    build:
+      context: .
+      args:
+        SERVICE: kafka-admin
+    image: shop/kafka-admin:local
+    container_name: shop-kafka-init
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+      KAFKA_PARTITIONS: ${KAFKA_PARTITIONS:-3}
+      KAFKA_REPLICATION_FACTOR: 1
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+
+  user-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: user-service
+    image: shop/user-service:local
+    container_name: shop-user-service
+    environment:
+      <<: *service-env
+      HTTP_PORT: "8081"
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD}@postgres:5432/shop_user?sslmode=disable
+      BCRYPT_COST: ${BCRYPT_COST:-10}
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD}
+    ports:
+      - "8081:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  product-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: product-service
+    image: shop/product-service:local
+    container_name: shop-product-service
+    environment:
+      <<: *service-env
+      HTTP_PORT: "8082"
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD}@postgres:5432/shop_product?sslmode=disable
+    ports:
+      - "8082:8082"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8082/healthz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  order-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: order-service
+    image: shop/order-service:local
+    container_name: shop-order-service
+    environment:
+      <<: *service-env
+      HTTP_PORT: "8083"
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD}@postgres:5432/shop_order?sslmode=disable
+      ORDER_AUTO_COMPLETE: ${ORDER_AUTO_COMPLETE:-true}
+    ports:
+      - "8083:8083"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8083/healthz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+  notification-service:
+    <<: *service-defaults
+    build:
+      context: .
+      args:
+        SERVICE: notification-service
+    image: shop/notification-service:local
+    container_name: shop-notification-service
+    environment:
+      <<: *service-env
+      HTTP_PORT: "8084"
+      POSTGRES_DSN: postgres://${POSTGRES_USER:-shop}:${POSTGRES_PASSWORD}@postgres:5432/shop_notification?sslmode=disable
+    ports:
+      - "8084:8084"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8084/healthz > /dev/null || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 15s
+
+volumes:
+  postgres-data:
+  redpanda-data:
