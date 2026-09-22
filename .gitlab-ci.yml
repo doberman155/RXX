@@ -1,0 +1,158 @@
+# CI/CD для монорепозитория shop: line/vet/fmt, юнит- и интеграционные тесты
+# (PostgreSQL и Redpanda подняты как сервисы GitLab CI, как в docker-compose.yaml),
+# сборка и публикация Docker-образов сервисов из cmd/* в GitLab Container Registry.
+
+stages:
+  - lint
+  - test
+  - build
+
+variables:
+  GOPATH: "$CI_PROJECT_DIR/.go"
+  GOMODCACHE: "$CI_PROJECT_DIR/.go/pkg/mod"
+  GOCACHE: "$CI_PROJECT_DIR/.go/cache"
+  POSTGRES_USER: shop
+  POSTGRES_PASSWORD: shop_ci_password
+  POSTGRES_DB: postgres
+  TEST_POSTGRES_DSN: "postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/postgres?sslmode=disable"
+  TEST_KAFKA_BROKERS: "redpanda:9092"
+  DOCKER_HOST: tcp://docker:2376
+  DOCKER_TLS_CERTDIR: "/certs"
+  DOCKER_TLS_VERIFY: 1
+  DOCKER_CERT_PATH: "$DOCKER_TLS_CERTDIR/client"
+
+workflow:
+  rules:
+    # для веток с открытым MR гоняем только пайплайн самого MR, а не ещё
+    # и дублирующий push-пайплайн на тот же коммит.
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+    - if: '$CI_COMMIT_BRANCH && $CI_OPEN_MERGE_REQUESTS'
+      when: never
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH'
+
+default:
+  image: golang:1.26
+  cache:
+    key: go-mod-cache
+    paths:
+      - .go/pkg/mod
+  before_script:
+    - go mod download
+
+# ---------------------------------------------------------------------------
+# lint
+# ---------------------------------------------------------------------------
+
+lint:
+  stage: lint
+  script:
+    - go build ./...
+    - go vet ./...
+    - test -z "$(gofmt -l .)" || (echo "gofmt нашёл неотформатированные файлы:"; gofmt -l .; exit 1)
+
+# ---------------------------------------------------------------------------
+# test
+# ---------------------------------------------------------------------------
+
+unit-test:
+  stage: test
+  script:
+    - go test ./... -race -count=1
+
+integration-test:
+  stage: test
+  services:
+    - name: postgres:17-alpine
+      alias: postgres
+      variables:
+        POSTGRES_USER: $POSTGRES_USER
+        POSTGRES_PASSWORD: $POSTGRES_PASSWORD
+        POSTGRES_DB: $POSTGRES_DB
+    - name: docker.redpanda.com/redpandadata/redpanda:v25.1.1
+      alias: redpanda
+      command:
+        - redpanda
+        - start
+        - --mode=dev-container
+        - --smp=1
+        - --memory=1G
+        - --default-log-level=warn
+        - --kafka-addr=internal://0.0.0.0:9092
+        - --advertise-kafka-addr=internal://redpanda:9092
+  script:
+    # ждём, пока postgres и redpanda откроют порты: сервисы GitLab CI не
+    # гарантируют готовность к моменту старта job.
+    - |
+      for target in postgres:5432 redpanda:9092; do
+        host="${target%%:*}"; port="${target##*:}"
+        echo "жду ${host}:${port}..."
+        for i in $(seq 1 30); do
+          bash -c "echo > /dev/tcp/${host}/${port}" 2>/dev/null && break
+          sleep 2
+        done
+      done
+      sleep 5
+    - go test -tags=integration ./... -race -count=1 -coverprofile=coverage.out -coverpkg=./internal/...,./pkg/...
+    - go tool cover -func=coverage.out | tail -1
+  coverage: '/total:\s+\(statements\)\s+(\d+\.\d+)%/'
+  artifacts:
+    paths:
+      - coverage.out
+    expire_in: 7 days
+
+# ---------------------------------------------------------------------------
+# build
+# ---------------------------------------------------------------------------
+
+.build_service:
+  stage: build
+  image: docker:27
+  services:
+    - docker:27-dind
+  cache: {}
+  before_script:
+    - docker login -u "$CI_REGISTRY_USER" -p "$CI_REGISTRY_PASSWORD" "$CI_REGISTRY"
+  script:
+    - >
+      docker build
+      --build-arg SERVICE="$SERVICE"
+      -t "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHORT_SHA"
+      -t "$CI_REGISTRY_IMAGE/$SERVICE:latest"
+      .
+    - docker push "$CI_REGISTRY_IMAGE/$SERVICE:$CI_COMMIT_SHORT_SHA"
+    - docker push "$CI_REGISTRY_IMAGE/$SERVICE:latest"
+  rules:
+    - if: '$CI_COMMIT_TAG'
+    - if: '$CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH'
+    - if: '$CI_PIPELINE_SOURCE == "merge_request_event"'
+      when: manual
+      allow_failure: true
+    - when: manual
+      allow_failure: true
+
+build:user-service:
+  extends: .build_service
+  variables:
+    SERVICE: user-service
+
+build:product-service:
+  extends: .build_service
+  variables:
+    SERVICE: product-service
+
+build:order-service:
+  extends: .build_service
+  variables:
+    SERVICE: order-service
+
+build:notification-service:
+  extends: .build_service
+  variables:
+    SERVICE: notification-service
+
+build:kafka-admin:
+  extends: .build_service
+  variables:
+    SERVICE: kafka-admin
